@@ -428,6 +428,11 @@ def get_stock():
 
     try:
         ticker, hist = _fetch_hist(symbol)
+        # Auto-retry bare Japanese stock codes (e.g. 7203 → 7203.T)
+        if hist.empty and re.match(r'^\d{4,5}$', symbol):
+            ticker, hist = _fetch_hist(symbol + '.T')
+            if not hist.empty:
+                symbol = symbol + '.T'
         # Auto-retry as crypto (e.g. BTC → BTC-USD)
         if hist.empty and not symbol.endswith('-USD'):
             ticker, hist = _fetch_hist(symbol + '-USD')

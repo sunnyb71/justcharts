@@ -886,7 +886,7 @@ function loadTickers() {
 
 // ── Apply saved theme + chart size on load ───────────────────────────────────
 (function () {
-  const theme = localStorage.getItem('theme') || 'light';
+  const theme = localStorage.getItem('theme') || 'dark';
   if (theme === 'dark') {
     document.documentElement.dataset.theme = 'dark';
     document.getElementById('theme-btn').textContent = 'Light';
