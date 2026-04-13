@@ -489,9 +489,25 @@ def get_stock():
         pass
 
     currency     = info.get('currency', 'USD')
-    name         = info.get('longName') or info.get('shortName') or symbol
+    name         = info.get('longName') or info.get('shortName') or ''
     # Strip trailing futures expiry date e.g. "Copper Sep 24" → "Copper"
     name = re.sub(r'\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{2,4}$', '', name).strip()
+    # If info didn't return a name, look it up via Yahoo Finance search
+    if not name or name == symbol:
+        try:
+            r = req.get(
+                'https://query2.finance.yahoo.com/v1/finance/search',
+                params={'q': symbol, 'quotesCount': 1, 'newsCount': 0, 'lang': 'en-US'},
+                headers={'User-Agent': 'Mozilla/5.0'},
+                timeout=5
+            )
+            quotes = r.json().get('quotes', [])
+            if quotes:
+                name = quotes[0].get('longname') or quotes[0].get('shortname') or symbol
+        except Exception:
+            pass
+    if not name:
+        name = symbol
     latest_price = (
         info.get('currentPrice') or
         info.get('regularMarketPrice') or
