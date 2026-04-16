@@ -10,7 +10,7 @@ import json
 import os
 import secrets
 from pathlib import Path
-from datetime import date as _dt_date, datetime as _dt_datetime
+from datetime import date as _dt_date, datetime as _dt_datetime, timedelta as _timedelta
 from concurrent.futures import ThreadPoolExecutor
 
 # ── Database backend: PostgreSQL (production) or SQLite (local / tests) ───────
@@ -475,22 +475,40 @@ def _get_stock_data(symbol, period):
         pass
 
     # ── Period baseline (for % change matching Google/Yahoo Finance) ──────────
-    # 1D  → use yesterday's official close (prev_close, populated below in fund_data)
-    # 5D  → close of the trading day BEFORE the 5D window.  Fetch 6 daily bars
-    #        so iloc[0] is the day before the window; iloc[1..5] are inside it.
-    # All other periods use daily bars, so points[0].close is already correct.
+    # Google/Yahoo Finance define each range as N *calendar* days, not N trading
+    # days.  The % change baseline is the official close of the last trading day
+    # that falls on or before (today - N_calendar_days).
+    #
+    # yfinance's period= strings often include 1-2 extra days, so we scan the
+    # raw hist bars (already fetched above) for the last bar whose date ≤ target.
+    # This avoids any extra API calls.
+    #
+    # 1D is handled separately: we use prev_close from fund_data (computed later).
+    _PERIOD_CALENDAR_DAYS = {
+        '5d':  5,
+        '1mo': 30,
+        '3mo': 90,
+        '6mo': 180,
+        '1y':  365,
+        '3y':  365 * 3,
+        '5y':  365 * 5,
+    }
     period_baseline = None
-    if period == '5d':
-        try:
-            d6 = ticker.history(period='6d', interval='1d', auto_adjust=True)
-            if not d6.empty:
-                v = float(d6.iloc[0]['Close'])
+    if period != '1d' and period in _PERIOD_CALENDAR_DAYS:
+        target_date = _dt_date.today() - _timedelta(days=_PERIOD_CALENDAR_DAYS[period])
+        baseline_cand = None
+        for ts, row in hist.iterrows():
+            bar_date = ts.date() if hasattr(ts, 'date') else _dt_date.fromisoformat(str(ts)[:10])
+            if bar_date <= target_date:
+                v = float(row['Close'])
                 if math.isfinite(v) and v > 0:
-                    period_baseline = round(v, 2)
-        except Exception:
-            pass
+                    baseline_cand = round(v, 2)
+            else:
+                break  # hist is sorted ascending — nothing further will qualify
+        if baseline_cand is not None:
+            period_baseline = baseline_cand
     if period_baseline is None and period != '1d' and points:
-        period_baseline = points[0]['close']
+        period_baseline = points[0]['close']  # safe fallback
 
     # ── Fundamentals — sequential, reusing existing Ticker instance ───────────
     # Do NOT spawn inner threads here: the batch endpoint already runs multiple
