@@ -653,7 +653,12 @@ def _get_stock_data(symbol, period):
             'roic':          _safe(roic,       1),
             'earnings_date': earnings_date,
         }
-        _fund_cache_set(symbol, fund_data)
+        # Only cache if we got meaningful data — if ticker.info returned {} due
+        # to rate-limiting, all numeric fields will be None.  Don't cache that
+        # so the next request gets a fresh attempt instead of an hour of nulls.
+        _key_fields = ('pe_ratio', 'market_cap', 'eps', 'revenue', 'wk52high')
+        if any(fund_data.get(k) is not None for k in _key_fields):
+            _fund_cache_set(symbol, fund_data)
 
     # For 1D, the period baseline is yesterday's official close
     if period == '1d':
@@ -716,7 +721,10 @@ def get_stocks_batch():
                 return {'ok': False, 'symbol': sym, 'error': msg[11:], 'status': 429}
             return {'ok': False, 'symbol': sym, 'error': msg, 'status': 500}
 
-    workers = min(len(symbols), 10)
+    # Cap at 4 parallel workers — more than ~5 simultaneous ticker.info calls
+    # to Yahoo Finance triggers rate-limiting and returns empty info dicts,
+    # causing all metrics (P/E, EPS, etc.) to show as N/A.
+    workers = min(len(symbols), 4)
     with ThreadPoolExecutor(max_workers=workers) as ex:
         results = list(ex.map(_fetch_one, symbols))
 
