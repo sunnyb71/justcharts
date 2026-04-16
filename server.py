@@ -209,16 +209,29 @@ def _pick(*vals):
 
 
 def _fix_intraday_splits(hist, ticker_obj, period):
-    """Fix un-adjusted split prices in intraday data.
+    """Fix un-adjusted split prices in intraday data (5D only).
 
-    yfinance adjusts daily OHLCV for splits but often does NOT adjust intraday
-    (1h/5m) data when a split occurs inside the requested window.  This
-    function fetches the daily adjusted closes for the same window and, for
-    any trading day where the intraday last close differs from the daily
-    adjusted close by more than 5 %, scales all intraday prices for that day
-    by the ratio  daily_adj / intraday_last.  That makes the intraday series
-    continuous and split-corrected without touching data that is already fine.
+    yfinance adjusts daily OHLCV for splits but sometimes does NOT adjust
+    intraday (1h/5m) data when a split occurs inside the requested window.
+    This function checks whether the ratio between the daily adjusted close
+    and the intraday last close matches a known split ratio (e.g. 0.5 for a
+    2-for-1 split).  Only exact split ratios trigger a correction — normal
+    price movement (even large moves like ±20%) is intentionally ignored to
+    avoid corrupting volatile stocks like AppLovin, Nvidia, etc.
+
+    Not applied for 1D: splits cannot occur within a single trading day.
     """
+    # Split ratios: forward splits (ratio < 1) and reverse splits (ratio > 1)
+    # e.g. 2:1 forward → ratio 0.5; 3:1 forward → 0.333; 1:10 reverse → 10.0
+    _SPLIT_RATIOS = [
+        1/10, 1/8, 1/5, 1/4, 1/3, 2/5, 1/2, 2/3, 3/4,   # forward splits
+        4/3, 3/2, 5/2, 2.0, 5/2, 3.0, 4.0, 5.0, 8.0, 10.0,  # reverse splits
+    ]
+    _TOL = 0.025  # 2.5% tolerance around each known ratio
+
+    def _looks_like_split(r):
+        return any(abs(r - sr) <= _TOL * sr for sr in _SPLIT_RATIOS)
+
     if hist.empty:
         return hist
     try:
@@ -244,8 +257,10 @@ def _fix_intraday_splits(hist, ticker_obj, period):
             if last_intra <= 0:
                 continue
             ratio = daily_close / last_intra
-            if 0.95 <= ratio <= 1.05:   # within 5 % — no correction needed
+            if 0.99 <= ratio <= 1.01:   # within 1% — already aligned, no correction
                 continue
+            if not _looks_like_split(ratio):
+                continue  # normal price movement — do NOT scale
             for col in price_cols:
                 hist.loc[mask, col] = hist.loc[mask, col] * ratio
 
@@ -443,7 +458,8 @@ def _get_stock_data(symbol, period):
         for attempt in range(3):
             try:
                 h = t.history(period=period, interval=interval, prepost=False)
-                if intraday:
+                # Split correction only for 5D — no splits happen within a single day
+                if period == '5d':
                     h = _fix_intraday_splits(h, t, period)
                 return t, h
             except Exception as e:
