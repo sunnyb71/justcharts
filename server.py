@@ -208,65 +208,6 @@ def _pick(*vals):
     return None
 
 
-def _fix_intraday_splits(hist, ticker_obj, period):
-    """Fix un-adjusted split prices in intraday data (5D only).
-
-    yfinance adjusts daily OHLCV for splits but sometimes does NOT adjust
-    intraday (1h/5m) data when a split occurs inside the requested window.
-    This function checks whether the ratio between the daily adjusted close
-    and the intraday last close matches a known split ratio (e.g. 0.5 for a
-    2-for-1 split).  Only exact split ratios trigger a correction — normal
-    price movement (even large moves like ±20%) is intentionally ignored to
-    avoid corrupting volatile stocks like AppLovin, Nvidia, etc.
-
-    Not applied for 1D: splits cannot occur within a single trading day.
-    """
-    # Split ratios: forward splits (ratio < 1) and reverse splits (ratio > 1)
-    # e.g. 2:1 forward → ratio 0.5; 3:1 forward → 0.333; 1:10 reverse → 10.0
-    _SPLIT_RATIOS = [
-        1/10, 1/8, 1/5, 1/4, 1/3, 2/5, 1/2, 2/3, 3/4,   # forward splits
-        4/3, 3/2, 5/2, 2.0, 5/2, 3.0, 4.0, 5.0, 8.0, 10.0,  # reverse splits
-    ]
-    _TOL = 0.025  # 2.5% tolerance around each known ratio
-
-    def _looks_like_split(r):
-        return any(abs(r - sr) <= _TOL * sr for sr in _SPLIT_RATIOS)
-
-    if hist.empty:
-        return hist
-    try:
-        daily = ticker_obj.history(period=period, interval='1d')
-        if daily.empty:
-            return hist
-
-        daily_map = {}
-        for ts, row in daily.iterrows():
-            c = float(row['Close'])
-            if math.isfinite(c) and c > 0:
-                daily_map[ts.date()] = c
-
-        hist = hist.copy()
-        idx_dates = hist.index.date
-        price_cols = [c for c in ('Open', 'High', 'Low', 'Close') if c in hist.columns]
-
-        for d, daily_close in daily_map.items():
-            mask = idx_dates == d
-            if not mask.any():
-                continue
-            last_intra = float(hist.loc[mask, 'Close'].iloc[-1])
-            if last_intra <= 0:
-                continue
-            ratio = daily_close / last_intra
-            if 0.99 <= ratio <= 1.01:   # within 1% — already aligned, no correction
-                continue
-            if not _looks_like_split(ratio):
-                continue  # normal price movement — do NOT scale
-            for col in price_cols:
-                hist.loc[mask, col] = hist.loc[mask, col] * ratio
-
-        return hist
-    except Exception:
-        return hist     # on any error return original data unchanged
 
 
 # ── Flask app ─────────────────────────────────────────────────────────────────
@@ -422,7 +363,7 @@ _ALIASES = {
 
 _INTERVAL_MAP = {
     '1d':  '5m',
-    '5d':  '1h',
+    '5d':  '30m',   # 30-min bars match Google Finance / Yahoo Finance 5D view
     '1mo': '1d',
     '3mo': '1d',
     '6mo': '1wk',
@@ -431,7 +372,7 @@ _INTERVAL_MAP = {
     '5y':  '1mo',
 }
 
-_MAX_PTS = {'1d': 80, '5d': 50, '1mo': 60, '3mo': 90, '6mo': 60, '1y': 60, '3y': 80, '5y': 40}
+_MAX_PTS = {'1d': 80, '5d': 80, '1mo': 60, '3mo': 90, '6mo': 60, '1y': 60, '3y': 80, '5y': 40}
 
 
 def _get_stock_data(symbol, period):
@@ -458,9 +399,6 @@ def _get_stock_data(symbol, period):
         for attempt in range(3):
             try:
                 h = t.history(period=period, interval=interval, prepost=False)
-                # Split correction only for 5D — no splits happen within a single day
-                if period == '5d':
-                    h = _fix_intraday_splits(h, t, period)
                 return t, h
             except Exception as e:
                 msg = str(e).lower()
@@ -511,7 +449,7 @@ def _get_stock_data(symbol, period):
 
     points = [
         {
-            'date': ts.strftime('%Y-%m-%dT%H:%M') if intraday else str(ts.date()),
+            'date': ts.isoformat() if intraday else str(ts.date()),
             'close': round(float(row['Close']), 2)
         }
         for ts, row in hist.iterrows()
