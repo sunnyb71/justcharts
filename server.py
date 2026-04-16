@@ -462,45 +462,47 @@ def _get_stock_data(symbol, period):
         step = max(1, len(points) // limit)
         points = points[::step]
 
-    # ── Fetch price metadata + fundamentals ──────────────────────────────────
-    # If fundamentals are already cached, skip the slow yfinance calls entirely
+    # ── Live price (lightweight fast_info call) ───────────────────────────────
+    # Use ticker.fast_info.last_price for a real-time quote that matches what
+    # Google / Yahoo Finance display as the current price.  Falls back to the
+    # last bar close if fast_info is unavailable.
+    live_price = None
+    try:
+        lp = ticker.fast_info.last_price
+        if lp and math.isfinite(float(lp)) and float(lp) > 0:
+            live_price = float(lp)
+    except Exception:
+        pass
+
+    # ── Fundamentals — sequential, reusing existing Ticker instance ───────────
+    # Do NOT spawn inner threads here: the batch endpoint already runs multiple
+    # stocks in parallel, so inner parallelism would flood Yahoo Finance with
+    # 40+ simultaneous requests and cause rate-limiting / empty info responses.
     fund_data = _fund_cache_get(symbol)
     if fund_data is None:
-        # Parallel fetch: info, financials, balance_sheet, calendar
-        # Use separate Ticker instances per thread for safety
-        def _fetch_info():
-            try:
-                return yf.Ticker(symbol).info
-            except Exception:
-                return {}
+        info = {}
+        try:
+            info = ticker.info
+        except Exception:
+            pass
 
-        def _fetch_fin():
-            try:
-                return yf.Ticker(symbol).financials
-            except Exception:
-                return None
+        fin = None
+        try:
+            fin = ticker.financials
+        except Exception:
+            pass
 
-        def _fetch_bs():
-            try:
-                return yf.Ticker(symbol).balance_sheet
-            except Exception:
-                return None
+        bs_data = None
+        try:
+            bs_data = ticker.balance_sheet
+        except Exception:
+            pass
 
-        def _fetch_cal():
-            try:
-                return yf.Ticker(symbol).calendar
-            except Exception:
-                return None
-
-        with ThreadPoolExecutor(max_workers=4) as ex:
-            f_info = ex.submit(_fetch_info)
-            f_fin  = ex.submit(_fetch_fin)
-            f_bs   = ex.submit(_fetch_bs)
-            f_cal  = ex.submit(_fetch_cal)
-            info     = f_info.result()
-            fin      = f_fin.result()
-            bs_data  = f_bs.result()
-            cal_data = f_cal.result()
+        cal_data = None
+        try:
+            cal_data = ticker.calendar
+        except Exception:
+            pass
 
         name     = info.get('longName') or info.get('shortName') or ''
         # Strip trailing futures expiry date e.g. "Copper Sep 24" → "Copper"
@@ -621,7 +623,9 @@ def _get_stock_data(symbol, period):
         'symbol':       symbol,
         'currency':     fund_data.get('currency', 'USD'),
         'points':       points,
-        'latest_price': _safe(points[-1]['close'] if points else None),
+        # Use live price from fast_info so % change matches Google/Yahoo Finance
+        # (last daily bar = yesterday's close, misses today's intraday move)
+        'latest_price': _safe(live_price or (points[-1]['close'] if points else None)),
     }
     _price_cache_set(symbol, period, price_data)
     return {**price_data, **fund_data}

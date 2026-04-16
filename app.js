@@ -323,7 +323,8 @@ function renderIndividualCharts(stocksData) {
     .map((stock, i) => {
       const prices = stock.points.map(p => p.close);
       const latest = stock.latest_price ?? prices[prices.length - 1];
-      return { i, pct: (latest - prices[0]) / prices[0] * 100 };
+      const base = _baseline(stock);
+      return { i, pct: base ? (latest - base) / base * 100 : 0 };
     })
     .sort((a, b) => b.pct - a.pct)
     .forEach((item, rank) => { rankMap[item.i] = rank + 1; });
@@ -499,7 +500,7 @@ function _renderCard(grid, stock, i, rankLabel) {
 
   const labels      = stock.points.map(p => formatDate(p.date));
   const prices      = stock.points.map(p => p.close);
-  const first       = prices[0];
+  const first       = _baseline(stock);
   const displayPrice = stock.latest_price ?? prices[prices.length - 1];
   const pct         = ((displayPrice - first) / first * 100).toFixed(2);
   const isUp        = pct >= 0;
