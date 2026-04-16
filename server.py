@@ -321,26 +321,10 @@ def get_news():
         return jsonify([])
 
 
-@app.route('/api/stock')
-def get_stock():
-    symbol = request.args.get('symbol', '').strip().upper()
-    period = request.args.get('range', '1mo')
+_VALID_PERIODS = {'1d', '5d', '1mo', '3mo', '6mo', '1y', '3y', '5y'}
 
-    if not symbol:
-        return jsonify({'error': 'Missing symbol parameter'}), 400
-
-    _valid_periods = {'1d', '5d', '1mo', '3mo', '6mo', '1y', '3y', '5y'}
-    if period not in _valid_periods:
-        return jsonify({'error': f'Invalid range "{period}". Must be one of: {", ".join(sorted(_valid_periods))}'}), 400
-
-    # Serve from cache — price and fundamentals cached independently
-    price_cached = _price_cache_get(symbol, period)
-    fund_cached  = _fund_cache_get(symbol)
-    if price_cached and fund_cached:
-        return jsonify({**price_cached, **fund_cached})
-
-    # Common name aliases → yfinance tickers
-    aliases = {
+# ── Shared aliases dict (used by both single and batch endpoints) ─────────────
+_ALIASES = {
         # Commodities
         'SILVER':      'SI=F',
         'COPPER':      'HG=F',
@@ -419,21 +403,38 @@ def get_stock():
         'ASTRAZENECA': 'AZN.L',
         'UNILEVER':    'ULVR.L',
         'FERRARI':     'RACE.MI',
-    }
-    symbol = aliases.get(symbol, symbol)
+}
 
-    interval_map = {
-        '1d':  '5m',
-        '5d':  '1h',
-        '1mo': '1d',
-        '3mo': '1d',
-        '6mo': '1wk',
-        '1y':  '1wk',
-        '3y':  '1wk',
-        '5y':  '1mo',
-    }
-    interval = interval_map.get(period, '1d')
+_INTERVAL_MAP = {
+    '1d':  '5m',
+    '5d':  '1h',
+    '1mo': '1d',
+    '3mo': '1d',
+    '6mo': '1wk',
+    '1y':  '1wk',
+    '3y':  '1wk',
+    '5y':  '1mo',
+}
 
+_MAX_PTS = {'1d': 80, '5d': 50, '1mo': 60, '3mo': 90, '6mo': 60, '1y': 60, '3y': 80, '5y': 40}
+
+
+def _get_stock_data(symbol, period):
+    """Fetch price + fundamentals for one symbol/period. Returns result dict.
+
+    Raises:
+        ValueError  – symbol not found (404-worthy)
+        Exception   – with message starting 'RATE_LIMIT:' for 429-worthy errors
+        Exception   – anything else for 500-worthy errors
+    """
+    # ── Cache: both tiers warm? → return immediately ─────────────────────────
+    price_cached = _price_cache_get(symbol, period)
+    fund_cached  = _fund_cache_get(symbol)
+    if price_cached and fund_cached:
+        return {**price_cached, **fund_cached}
+
+    symbol   = _ALIASES.get(symbol, symbol)
+    interval = _INTERVAL_MAP.get(period, '1d')
     intraday = period in ('1d', '5d')
 
     def _fetch_hist(sym):
@@ -448,7 +449,7 @@ def get_stock():
             except Exception as e:
                 msg = str(e).lower()
                 if ('429' in msg or 'too many' in msg or 'rate' in msg) and attempt < 2:
-                    time.sleep(2 ** attempt)   # 1 s, then 2 s
+                    time.sleep(2 ** attempt)
                 else:
                     raise
 
@@ -467,8 +468,8 @@ def get_stock():
     except Exception as e:
         msg = str(e)
         if '429' in msg or 'Too Many' in msg or 'rate' in msg.lower():
-            return jsonify({'error': 'Rate limited by data provider — please wait a moment and try again.'}), 429
-        return jsonify({'error': msg}), 500
+            raise Exception('RATE_LIMIT:Rate limited by data provider — please wait a moment and try again.')
+        raise
 
     # If still no data, try resolving as a company name via search
     if hist.empty:
@@ -490,7 +491,7 @@ def get_stock():
             pass
 
     if hist.empty:
-        return jsonify({'error': f'No data found for "{symbol}". Check the symbol.'}), 404
+        raise ValueError(f'No data found for "{symbol}". Check the symbol.')
 
     points = [
         {
@@ -502,8 +503,7 @@ def get_stock():
     ]
 
     # Downsample to keep charts clean for long ranges
-    max_pts = {'1d': 80, '5d': 50, '1mo': 60, '3mo': 90, '6mo': 60, '1y': 60, '3y': 80, '5y': 40}
-    limit = max_pts.get(period, 100)
+    limit = _MAX_PTS.get(period, 100)
     if len(points) > limit:
         step = max(1, len(points) // limit)
         points = points[::step]
@@ -665,7 +665,58 @@ def get_stock():
         'latest_price': _safe(points[-1]['close'] if points else None),
     }
     _price_cache_set(symbol, period, price_data)
-    return jsonify({**price_data, **fund_data})
+    return {**price_data, **fund_data}
+
+
+# ── Single-stock endpoint (thin wrapper around _get_stock_data) ───────────────
+@app.route('/api/stock')
+def get_stock():
+    symbol = request.args.get('symbol', '').strip().upper()
+    period = request.args.get('range', '1mo')
+    if not symbol:
+        return jsonify({'error': 'Missing symbol parameter'}), 400
+    if period not in _VALID_PERIODS:
+        return jsonify({'error': f'Invalid range "{period}". Must be one of: {", ".join(sorted(_VALID_PERIODS))}'}), 400
+    try:
+        return jsonify(_get_stock_data(symbol, period))
+    except ValueError as e:
+        return jsonify({'error': str(e)}), 404
+    except Exception as e:
+        msg = str(e)
+        if msg.startswith('RATE_LIMIT:'):
+            return jsonify({'error': msg[11:]}), 429
+        return jsonify({'error': msg}), 500
+
+
+# ── Batch endpoint: fetch N symbols in parallel (one HTTP round trip) ─────────
+@app.route('/api/stocks')
+def get_stocks_batch():
+    symbols_raw = request.args.get('symbols', '').strip()
+    period      = request.args.get('range', '1mo')
+    if not symbols_raw:
+        return jsonify({'error': 'Missing symbols parameter'}), 400
+    if period not in _VALID_PERIODS:
+        return jsonify({'error': f'Invalid range "{period}"'}), 400
+    symbols = [s.strip().upper() for s in symbols_raw.split(',') if s.strip()][:50]
+    if not symbols:
+        return jsonify({'error': 'No valid symbols'}), 400
+
+    def _fetch_one(sym):
+        try:
+            return {'ok': True, 'data': _get_stock_data(sym, period)}
+        except ValueError as e:
+            return {'ok': False, 'symbol': sym, 'error': str(e), 'status': 404}
+        except Exception as e:
+            msg = str(e)
+            if msg.startswith('RATE_LIMIT:'):
+                return {'ok': False, 'symbol': sym, 'error': msg[11:], 'status': 429}
+            return {'ok': False, 'symbol': sym, 'error': msg, 'status': 500}
+
+    workers = min(len(symbols), 10)
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        results = list(ex.map(_fetch_one, symbols))
+
+    return jsonify(results)
 
 
 @app.route('/api/watchlists', methods=['GET'])

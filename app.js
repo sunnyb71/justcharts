@@ -172,32 +172,45 @@ document.querySelectorAll('.range-btn').forEach(btn => {
 });
 
 // ── Fetch from our Python backend ─────────────────────────────────────────
+function _parseStockData(data) {
+  return {
+    symbol:        data.symbol,
+    name:          data.name || data.symbol,
+    currency:      data.currency || 'USD',
+    points:        data.points.map(p => ({ date: new Date(p.date), close: p.close })),
+    latest_price:  data.latest_price,
+    pe_ratio:      data.pe_ratio,
+    market_cap:    data.market_cap,
+    eps:           data.eps,
+    target:        data.target,
+    revenue:       data.revenue,
+    ps_ratio:      data.ps_ratio,
+    wk52high:      data.wk52high,
+    wk52low:       data.wk52low,
+    rev_growth:    data.rev_growth,
+    ni_growth:     data.ni_growth,
+    peg_ratio:     data.peg_ratio,
+    roic:          data.roic,
+    earnings_date: data.earnings_date,
+  };
+}
+
 async function fetchStock(symbol) {
   const resp = await fetch(`/api/stock?symbol=${encodeURIComponent(symbol)}&range=${currentRange}`);
   let data;
   try { data = await resp.json(); } catch { data = {}; }
   if (!resp.ok) throw new Error(data.error || `Failed to fetch "${symbol}"`);
+  return _parseStockData(data);
+}
 
-  return {
-    symbol:       data.symbol,
-    name:         data.name || data.symbol,
-    currency:     data.currency || 'USD',
-    points:       data.points.map(p => ({ date: new Date(p.date), close: p.close })),
-    latest_price: data.latest_price,
-    pe_ratio:   data.pe_ratio,
-    market_cap: data.market_cap,
-    eps:        data.eps,
-    target:     data.target,
-    revenue:    data.revenue,
-    ps_ratio:   data.ps_ratio,
-    wk52high:   data.wk52high,
-    wk52low:    data.wk52low,
-    rev_growth:     data.rev_growth,
-    ni_growth:      data.ni_growth,
-    peg_ratio:      data.peg_ratio,
-    roic:           data.roic,
-    earnings_date:  data.earnings_date,
-  };
+// Batch fetch: one HTTP request, backend processes all symbols in parallel
+async function fetchStocksBatch(symbols) {
+  const url = `/api/stocks?symbols=${encodeURIComponent(symbols.join(','))}&range=${currentRange}`;
+  const resp = await fetch(url);
+  let results;
+  try { results = await resp.json(); } catch { results = []; }
+  if (!resp.ok) throw new Error((results && results.error) || 'Batch fetch failed');
+  return results; // array of {ok, data} or {ok:false, symbol, error}
 }
 
 // ── Tick limit based on range ────────────────────────────────────────────────
@@ -583,24 +596,35 @@ async function compareStocks() {
   const errors = [];
 
   try {
-    const fetchPromises = symbols.map((sym, i) =>
-      fetchStock(sym).then(stock => {
-        if (seq !== _compareSeq) return;
+    // One HTTP round trip — backend processes all symbols in parallel
+    let batchResults;
+    try {
+      batchResults = await fetchStocksBatch(symbols);
+    } catch (err) {
+      if (seq !== _compareSeq) return;
+      showError(err.message);
+      return;
+    }
+
+    if (seq !== _compareSeq) return;
+
+    // Render each card as we process the batch response
+    batchResults.forEach((result, i) => {
+      if (seq !== _compareSeq) return;
+      if (result.ok) {
+        const stock = _parseStockData(result.data);
         stocksData[i] = stock;
         _renderCard(grid, stock, i, '#?');
-      }).catch(err => {
-        if (seq !== _compareSeq) return;
-        errors.push(err.message);
+      } else {
+        errors.push(result.error || `Failed to fetch "${symbols[i]}"`);
         const ph = document.getElementById(`ind-card-${i}`);
         if (ph) {
           ph.className = 'individual-card card-error-state';
           ph.style.borderTop = `3px solid ${COLORS[i % COLORS.length]}`;
-          ph.innerHTML = `<div class="card-skeleton-label">${escHtml(sym)}: ${escHtml(err.message)}</div>`;
+          ph.innerHTML = `<div class="card-skeleton-label">${escHtml(symbols[i])}: ${escHtml(result.error || 'No data')}</div>`;
         }
-      })
-    );
-
-    await Promise.allSettled(fetchPromises);
+      }
+    });
 
     if (seq !== _compareSeq) return;
 

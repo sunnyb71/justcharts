@@ -640,6 +640,21 @@ class TestStockAPI:
         assert r.status_code == 400
         assert 'error' in r.get_json()
 
+    def test_batch_missing_symbols_returns_400(self, client):
+        r = client.get('/api/stocks')
+        assert r.status_code == 400
+        assert 'error' in r.get_json()
+
+    def test_batch_invalid_period_returns_400(self, client):
+        r = client.get('/api/stocks?symbols=AAPL&range=invalid')
+        assert r.status_code == 400
+        assert 'error' in r.get_json()
+
+    def test_batch_empty_symbols_returns_400(self, client):
+        r = client.get('/api/stocks?symbols=,,,')
+        assert r.status_code == 400
+        assert 'error' in r.get_json()
+
     def test_search_empty_query_returns_empty_list(self, client):
         r = client.get('/api/search?q=')
         assert r.status_code == 200
