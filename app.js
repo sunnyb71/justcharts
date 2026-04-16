@@ -179,7 +179,8 @@ function _parseStockData(data) {
     currency:      data.currency || 'USD',
     points:        data.points.map(p => ({ date: new Date(p.date), close: p.close })),
     latest_price:  data.latest_price,
-    prev_close:    data.prev_close ?? null,
+    prev_close:       data.prev_close ?? null,
+    period_baseline:  data.period_baseline ?? null,
     pe_ratio:      data.pe_ratio,
     market_cap:    data.market_cap,
     eps:           data.eps,
@@ -197,10 +198,13 @@ function _parseStockData(data) {
 }
 
 // Return the correct baseline price for % change calculation.
-// 1D: use yesterday's official close (matches Google/Yahoo Finance).
-// All other ranges: use the first bar in the fetched history.
+// Uses period_baseline from the server which is:
+//   1D  → yesterday's official close
+//   5D  → close of the day before the 5-day window
+//   all others → close of the first daily bar in the period
+// Falls back to points[0].close if the server didn't supply it.
 function _baseline(stock) {
-  if (currentRange === '1d' && stock.prev_close != null) return stock.prev_close;
+  if (stock.period_baseline != null) return stock.period_baseline;
   return stock.points[0].close;
 }
 

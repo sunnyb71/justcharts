@@ -474,6 +474,24 @@ def _get_stock_data(symbol, period):
     except Exception:
         pass
 
+    # ── Period baseline (for % change matching Google/Yahoo Finance) ──────────
+    # 1D  → use yesterday's official close (prev_close, populated below in fund_data)
+    # 5D  → close of the trading day BEFORE the 5D window.  Fetch 6 daily bars
+    #        so iloc[0] is the day before the window; iloc[1..5] are inside it.
+    # All other periods use daily bars, so points[0].close is already correct.
+    period_baseline = None
+    if period == '5d':
+        try:
+            d6 = ticker.history(period='6d', interval='1d', auto_adjust=True)
+            if not d6.empty:
+                v = float(d6.iloc[0]['Close'])
+                if math.isfinite(v) and v > 0:
+                    period_baseline = round(v, 2)
+        except Exception:
+            pass
+    if period_baseline is None and period != '1d' and points:
+        period_baseline = points[0]['close']
+
     # ── Fundamentals — sequential, reusing existing Ticker instance ───────────
     # Do NOT spawn inner threads here: the batch endpoint already runs multiple
     # stocks in parallel, so inner parallelism would flood Yahoo Finance with
@@ -619,13 +637,18 @@ def _get_stock_data(symbol, period):
         }
         _fund_cache_set(symbol, fund_data)
 
+    # For 1D, the period baseline is yesterday's official close
+    if period == '1d':
+        period_baseline = fund_data.get('prev_close')
+
     price_data = {
-        'symbol':       symbol,
-        'currency':     fund_data.get('currency', 'USD'),
-        'points':       points,
+        'symbol':           symbol,
+        'currency':         fund_data.get('currency', 'USD'),
+        'points':           points,
         # Use live price from fast_info so % change matches Google/Yahoo Finance
         # (last daily bar = yesterday's close, misses today's intraday move)
-        'latest_price': _safe(live_price or (points[-1]['close'] if points else None)),
+        'latest_price':     _safe(live_price or (points[-1]['close'] if points else None)),
+        'period_baseline':  period_baseline,
     }
     _price_cache_set(symbol, period, price_data)
     return {**price_data, **fund_data}
