@@ -445,6 +445,31 @@ body {
 .individual-card.dragging  { opacity: 0.3; }
 .individual-card.drag-over { outline: 2px dashed #6366f1; outline-offset: -2px; }
 
+/* Skeleton loading card */
+.individual-card.card-skeleton {
+  min-height: 200px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  animation: card-pulse 1.4s ease-in-out infinite;
+}
+.individual-card.card-error-state {
+  min-height: 80px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  opacity: 0.6;
+}
+.card-skeleton-label {
+  font-size: 0.9rem;
+  color: var(--faint);
+  letter-spacing: 0.05em;
+}
+@keyframes card-pulse {
+  0%, 100% { opacity: 1; }
+  50%       { opacity: 0.5; }
+}
+
 .rank-badge {
   font-size: 0.82rem;
   font-weight: 800;

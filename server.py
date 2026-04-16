@@ -11,6 +11,7 @@ import os
 import secrets
 from pathlib import Path
 from datetime import date as _dt_date, datetime as _dt_datetime
+from concurrent.futures import ThreadPoolExecutor
 
 # ── Database backend: PostgreSQL (production) or SQLite (local / tests) ───────
 _DATABASE_URL = os.environ.get('DATABASE_URL', '')
@@ -149,18 +150,42 @@ def _migrate_anon(con, cid, user_id):
     con.commit()
 
 
-# ── In-memory response cache (90 s TTL) ─────────────────────────────────────
-_cache: dict = {}
-_CACHE_TTL   = 90  # seconds
+# ── Two-tier cache: price data (short TTL) + fundamentals (1 hour) ───────────
+# Price data TTL varies by range — intraday refreshes fast, historical is stable
+_PRICE_TTL = {
+    '1d':  3  * 60,   # 3 min  — intraday moves
+    '5d':  5  * 60,   # 5 min
+    '1mo': 15 * 60,   # 15 min
+    '3mo': 30 * 60,   # 30 min
+    '6mo': 60 * 60,   # 1 hour
+    '1y':  60 * 60,
+    '3y':  60 * 60,
+    '5y':  60 * 60,
+}
+_FUND_TTL = 60 * 60   # fundamentals (P/E, EPS, revenue…) change at most daily
 
-def _cache_get(key):
-    entry = _cache.get(key)
-    if entry and time.time() - entry['ts'] < _CACHE_TTL:
+_price_cache: dict = {}
+_fund_cache:  dict = {}
+
+def _price_cache_get(symbol, period):
+    key   = f'{symbol}|{period}'
+    entry = _price_cache.get(key)
+    ttl   = _PRICE_TTL.get(period, 15 * 60)
+    if entry and time.time() - entry['ts'] < ttl:
         return entry['data']
     return None
 
-def _cache_set(key, data):
-    _cache[key] = {'data': data, 'ts': time.time()}
+def _price_cache_set(symbol, period, data):
+    _price_cache[f'{symbol}|{period}'] = {'data': data, 'ts': time.time()}
+
+def _fund_cache_get(symbol):
+    entry = _fund_cache.get(symbol)
+    if entry and time.time() - entry['ts'] < _FUND_TTL:
+        return entry['data']
+    return None
+
+def _fund_cache_set(symbol, data):
+    _fund_cache[symbol] = {'data': data, 'ts': time.time()}
 
 
 def _safe(v, dec=2):
@@ -308,10 +333,11 @@ def get_stock():
     if period not in _valid_periods:
         return jsonify({'error': f'Invalid range "{period}". Must be one of: {", ".join(sorted(_valid_periods))}'}), 400
 
-    # Serve from cache if fresh
-    cached = _cache_get(f'{symbol}|{period}')
-    if cached:
-        return jsonify(cached)
+    # Serve from cache — price and fundamentals cached independently
+    price_cached = _price_cache_get(symbol, period)
+    fund_cached  = _fund_cache_get(symbol)
+    if price_cached and fund_cached:
+        return jsonify({**price_cached, **fund_cached})
 
     # Common name aliases → yfinance tickers
     aliases = {
@@ -482,133 +508,164 @@ def get_stock():
         step = max(1, len(points) // limit)
         points = points[::step]
 
-    info = {}
-    try:
-        info = ticker.info
-    except Exception:
-        pass
-
-    currency     = info.get('currency', 'USD')
-    name         = info.get('longName') or info.get('shortName') or ''
-    # Strip trailing futures expiry date e.g. "Copper Sep 24" → "Copper"
-    name = re.sub(r'\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{2,4}$', '', name).strip()
-    # If info didn't return a name, look it up via Yahoo Finance search
-    if not name or name == symbol:
-        try:
-            r = req.get(
-                'https://query2.finance.yahoo.com/v1/finance/search',
-                params={'q': symbol, 'quotesCount': 1, 'newsCount': 0, 'lang': 'en-US'},
-                headers={'User-Agent': 'Mozilla/5.0'},
-                timeout=5
-            )
-            quotes = r.json().get('quotes', [])
-            if quotes:
-                name = quotes[0].get('longname') or quotes[0].get('shortname') or symbol
-        except Exception:
-            pass
-    if not name:
-        name = symbol
-    latest_price = (
-        info.get('currentPrice') or
-        info.get('regularMarketPrice') or
-        (points[-1]['close'] if points else None)
-    )
-
-    pe       = _pick(info.get('trailingPE'),    info.get('forwardPE'))
-    cap      = _safe(info.get('marketCap'),     0)
-    eps      = _safe(info.get('trailingEps'))
-    target   = _safe(info.get('targetMeanPrice'))
-    revenue  = _safe(info.get('totalRevenue'),  0)
-    ps       = _safe(info.get('priceToSalesTrailing12Months'))
-    wk52high = _safe(info.get('fiftyTwoWeekHigh'))
-    wk52low  = _safe(info.get('fiftyTwoWeekLow'))
-    peg      = _pick(info.get('pegRatio'),      info.get('trailingPegRatio'))
-
-    # Earnings date
-    earnings_date = None
-    try:
-        cal = ticker.calendar
-        if isinstance(cal, dict) and 'Earnings Date' in cal:
-            for d in cal['Earnings Date']:
-                d2 = d.date() if hasattr(d, 'date') else d
-                if d2 >= _dt_date.today():
-                    earnings_date = str(d2)
-                    break
-    except Exception:
-        pass
-    if not earnings_date:
-        try:
-            ed = info.get('earningsDate')
-            if isinstance(ed, (list, tuple)) and ed:
-                ts = ed[0]
-                d2 = _dt_datetime.fromtimestamp(ts).date() if isinstance(ts, (int, float)) else ts
-                if hasattr(d2, 'date'): d2 = d2.date()
-                if d2 >= _dt_date.today():
-                    earnings_date = str(d2)
-        except Exception:
-            pass
-
-    rev_growth = None
-    ni_growth  = None
-    roic       = None
-    try:
-        fin = ticker.financials
-        if not fin.empty and fin.shape[1] >= 2:
-            if 'Total Revenue' in fin.index:
-                r = fin.loc['Total Revenue']
-                if r.iloc[1] and r.iloc[1] != 0:
-                    rev_growth = round((r.iloc[0] - r.iloc[1]) / abs(r.iloc[1]) * 100, 1)
-            if 'Net Income' in fin.index:
-                n = fin.loc['Net Income']
-                if n.iloc[1] and n.iloc[1] != 0:
-                    ni_growth = round((n.iloc[0] - n.iloc[1]) / abs(n.iloc[1]) * 100, 1)
-            # ROIC = Net Income / (Equity + Long-term Debt)
+    # ── Fetch price metadata + fundamentals ──────────────────────────────────
+    # If fundamentals are already cached, skip the slow yfinance calls entirely
+    fund_data = _fund_cache_get(symbol)
+    if fund_data is None:
+        # Parallel fetch: info, financials, balance_sheet, calendar
+        # Use separate Ticker instances per thread for safety
+        def _fetch_info():
             try:
-                bs = ticker.balance_sheet
-                if not bs.empty and 'Net Income' in fin.index:
-                    ni_val = fin.loc['Net Income'].iloc[0]
-                    equity = None
-                    for key in ('Stockholders Equity', 'Total Stockholder Equity', 'Common Stock Equity'):
-                        if key in bs.index:
-                            equity = bs.loc[key].iloc[0]
-                            break
-                    debt = 0
-                    for key in ('Long Term Debt', 'Long-Term Debt And Capital Lease Obligation'):
-                        if key in bs.index:
-                            debt = bs.loc[key].iloc[0]
-                            break
-                    ni_f  = _safe(ni_val,  1)
-                    eq_f  = _safe(equity,  1)
-                    dbt_f = _safe(debt,    1) or 0.0
-                    if ni_f is not None and eq_f and (eq_f + dbt_f) != 0:
-                        roic = round(ni_f / (eq_f + dbt_f) * 100, 1)
+                return yf.Ticker(symbol).info
+            except Exception:
+                return {}
+
+        def _fetch_fin():
+            try:
+                return yf.Ticker(symbol).financials
+            except Exception:
+                return None
+
+        def _fetch_bs():
+            try:
+                return yf.Ticker(symbol).balance_sheet
+            except Exception:
+                return None
+
+        def _fetch_cal():
+            try:
+                return yf.Ticker(symbol).calendar
+            except Exception:
+                return None
+
+        with ThreadPoolExecutor(max_workers=4) as ex:
+            f_info = ex.submit(_fetch_info)
+            f_fin  = ex.submit(_fetch_fin)
+            f_bs   = ex.submit(_fetch_bs)
+            f_cal  = ex.submit(_fetch_cal)
+            info     = f_info.result()
+            fin      = f_fin.result()
+            bs_data  = f_bs.result()
+            cal_data = f_cal.result()
+
+        name     = info.get('longName') or info.get('shortName') or ''
+        # Strip trailing futures expiry date e.g. "Copper Sep 24" → "Copper"
+        name = re.sub(r'\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{2,4}$', '', name).strip()
+        # If info didn't return a name, look it up via Yahoo Finance search
+        if not name or name == symbol:
+            try:
+                r = req.get(
+                    'https://query2.finance.yahoo.com/v1/finance/search',
+                    params={'q': symbol, 'quotesCount': 1, 'newsCount': 0, 'lang': 'en-US'},
+                    headers={'User-Agent': 'Mozilla/5.0'},
+                    timeout=5
+                )
+                quotes = r.json().get('quotes', [])
+                if quotes:
+                    name = quotes[0].get('longname') or quotes[0].get('shortname') or symbol
             except Exception:
                 pass
-    except Exception:
-        pass
+        if not name:
+            name = symbol
 
-    result = {
-        'symbol':        symbol,
-        'name':          name,
-        'currency':      currency,
-        'points':        points,
-        'latest_price':  _safe(latest_price),
-        'pe_ratio':      pe,
-        'market_cap':    cap,
-        'eps':           eps,
-        'target':        target,
-        'revenue':       revenue,
-        'ps_ratio':      ps,
-        'wk52high':      wk52high,
-        'wk52low':       wk52low,
-        'rev_growth':    _safe(rev_growth, 1),
-        'ni_growth':     _safe(ni_growth,  1),
-        'peg_ratio':     peg,
-        'roic':          _safe(roic,       1),
-        'earnings_date': earnings_date,
+        currency = info.get('currency', 'USD')
+        pe       = _pick(info.get('trailingPE'),    info.get('forwardPE'))
+        cap      = _safe(info.get('marketCap'),     0)
+        eps      = _safe(info.get('trailingEps'))
+        target   = _safe(info.get('targetMeanPrice'))
+        revenue  = _safe(info.get('totalRevenue'),  0)
+        ps       = _safe(info.get('priceToSalesTrailing12Months'))
+        wk52high = _safe(info.get('fiftyTwoWeekHigh'))
+        wk52low  = _safe(info.get('fiftyTwoWeekLow'))
+        peg      = _pick(info.get('pegRatio'),      info.get('trailingPegRatio'))
+
+        # Earnings date
+        earnings_date = None
+        try:
+            if isinstance(cal_data, dict) and 'Earnings Date' in cal_data:
+                for d in cal_data['Earnings Date']:
+                    d2 = d.date() if hasattr(d, 'date') else d
+                    if d2 >= _dt_date.today():
+                        earnings_date = str(d2)
+                        break
+        except Exception:
+            pass
+        if not earnings_date:
+            try:
+                ed = info.get('earningsDate')
+                if isinstance(ed, (list, tuple)) and ed:
+                    ts = ed[0]
+                    d2 = _dt_datetime.fromtimestamp(ts).date() if isinstance(ts, (int, float)) else ts
+                    if hasattr(d2, 'date'): d2 = d2.date()
+                    if d2 >= _dt_date.today():
+                        earnings_date = str(d2)
+            except Exception:
+                pass
+
+        rev_growth = None
+        ni_growth  = None
+        roic       = None
+        try:
+            if fin is not None and not fin.empty and fin.shape[1] >= 2:
+                if 'Total Revenue' in fin.index:
+                    r = fin.loc['Total Revenue']
+                    if r.iloc[1] and r.iloc[1] != 0:
+                        rev_growth = round((r.iloc[0] - r.iloc[1]) / abs(r.iloc[1]) * 100, 1)
+                if 'Net Income' in fin.index:
+                    n = fin.loc['Net Income']
+                    if n.iloc[1] and n.iloc[1] != 0:
+                        ni_growth = round((n.iloc[0] - n.iloc[1]) / abs(n.iloc[1]) * 100, 1)
+                # ROIC = Net Income / (Equity + Long-term Debt)
+                try:
+                    if bs_data is not None and not bs_data.empty and 'Net Income' in fin.index:
+                        ni_val = fin.loc['Net Income'].iloc[0]
+                        equity = None
+                        for key in ('Stockholders Equity', 'Total Stockholder Equity', 'Common Stock Equity'):
+                            if key in bs_data.index:
+                                equity = bs_data.loc[key].iloc[0]
+                                break
+                        debt = 0
+                        for key in ('Long Term Debt', 'Long-Term Debt And Capital Lease Obligation'):
+                            if key in bs_data.index:
+                                debt = bs_data.loc[key].iloc[0]
+                                break
+                        ni_f  = _safe(ni_val,  1)
+                        eq_f  = _safe(equity,  1)
+                        dbt_f = _safe(debt,    1) or 0.0
+                        if ni_f is not None and eq_f and (eq_f + dbt_f) != 0:
+                            roic = round(ni_f / (eq_f + dbt_f) * 100, 1)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        fund_data = {
+            'name':          name,
+            'currency':      currency,
+            'pe_ratio':      pe,
+            'market_cap':    cap,
+            'eps':           eps,
+            'target':        target,
+            'revenue':       revenue,
+            'ps_ratio':      ps,
+            'wk52high':      wk52high,
+            'wk52low':       wk52low,
+            'rev_growth':    _safe(rev_growth, 1),
+            'ni_growth':     _safe(ni_growth,  1),
+            'peg_ratio':     peg,
+            'roic':          _safe(roic,       1),
+            'earnings_date': earnings_date,
+        }
+        _fund_cache_set(symbol, fund_data)
+
+    price_data = {
+        'symbol':       symbol,
+        'currency':     fund_data.get('currency', 'USD'),
+        'points':       points,
+        'latest_price': _safe(points[-1]['close'] if points else None),
     }
-    _cache_set(f'{symbol}|{period}', result)
-    return jsonify(result)
+    _price_cache_set(symbol, period, price_data)
+    return jsonify({**price_data, **fund_data})
 
 
 @app.route('/api/watchlists', methods=['GET'])

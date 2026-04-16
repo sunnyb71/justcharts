@@ -290,7 +290,7 @@ function renderChart(stocksData) {
 // ── Individual stock charts ─────────────────────────────────────────────────
 function renderIndividualCharts(stocksData) {
   // Destroy any previously created individual charts
-  individualInstances.forEach(c => c.destroy());
+  individualInstances.forEach(c => c && c.destroy());
   individualInstances = [];
 
   const wrap = document.getElementById('individual-charts');
@@ -422,6 +422,120 @@ function renderIndividualCharts(stocksData) {
   initDragAndDrop();
 }
 
+// ── Render a single card into the grid (progressive) ────────────────────────
+function _renderCard(grid, stock, i, rankLabel) {
+  const old = document.getElementById(`ind-card-${i}`);
+  if (old) old.remove();
+
+  const d = daysUntil(stock.earnings_date);
+  const earningsBadge = d !== null
+    ? `<span class="earnings-badge">${d === 0 ? 'Earnings today' : `Earnings in ${d}d`}</span>`
+    : '';
+
+  const card = document.createElement('div');
+  card.className = 'individual-card';
+  card.id = `ind-card-${i}`;
+  card.setAttribute('draggable', rankSortOn ? 'false' : 'true');
+  card.style.borderTop = `3px solid ${COLORS[i % COLORS.length]}`;
+  card.innerHTML = `
+    <div class="flip-card-inner">
+      <div class="flip-front-content">
+        <div class="card-badges">
+          <span class="rank-badge" id="rank-badge-${i}">${rankLabel}</span>
+          <div class="card-badges-right">
+            ${earningsBadge}
+            <button class="news-btn" onclick="flipToNews(this, '${escHtml(stock.symbol)}')">News</button>
+            <span class="drag-handle" title="Drag to reorder">⠿</span>
+          </div>
+        </div>
+        <canvas id="chart-individual-${i}"></canvas>
+        <div class="individual-meta">
+          <div class="meta-row"><span class="meta-label">P/E</span><span class="meta-val">${stock.pe_ratio ?? 'N/A'}</span></div>
+          <div class="meta-row"><span class="meta-label">PEG</span><span class="meta-val">${stock.peg_ratio ?? 'N/A'}</span></div>
+          <div class="meta-row"><span class="meta-label">P/S</span><span class="meta-val">${stock.ps_ratio ?? 'N/A'}</span></div>
+          <div class="meta-row"><span class="meta-label">EPS</span><span class="meta-val">${formatPrice(stock.eps, stock.currency)}</span></div>
+          <div class="meta-row"><span class="meta-label">ROIC</span><span class="meta-val ${stock.roic != null ? (stock.roic >= 0 ? 'up' : 'down') : ''}">${stock.roic != null ? stock.roic + '%' : 'N/A'}</span></div>
+          <div class="meta-row"><span class="meta-label">Analyst Target</span><span class="meta-val">${formatPrice(stock.target, stock.currency)}</span></div>
+          <div class="meta-row"><span class="meta-label">52W High</span><span class="meta-val">${formatPrice(stock.wk52high, stock.currency)}</span></div>
+          <div class="meta-row"><span class="meta-label">52W Low</span><span class="meta-val">${formatPrice(stock.wk52low, stock.currency)}</span></div>
+          <div class="meta-row"><span class="meta-label">Mkt Cap</span><span class="meta-val">${formatMarketCap(stock.market_cap, stock.currency)}</span></div>
+          <div class="meta-row"><span class="meta-label">Revenue</span><span class="meta-val">${formatMarketCap(stock.revenue, stock.currency)}</span></div>
+          <div class="meta-row"><span class="meta-label">Rev Growth</span><span class="meta-val ${stock.rev_growth != null ? (stock.rev_growth >= 0 ? 'up' : 'down') : ''}">${stock.rev_growth != null ? (stock.rev_growth >= 0 ? '+' : '') + stock.rev_growth + '%' : 'N/A'}</span></div>
+          <div class="meta-row"><span class="meta-label">Net Inc Growth</span><span class="meta-val ${stock.ni_growth != null ? (stock.ni_growth >= 0 ? 'up' : 'down') : ''}">${stock.ni_growth != null ? (stock.ni_growth >= 0 ? '+' : '') + stock.ni_growth + '%' : 'N/A'}</span></div>
+        </div>
+      </div>
+      <div class="flip-back-content" style="display:none">
+        <div class="news-header">
+          <span class="news-header-symbol">${escHtml(stock.name || stock.symbol)} — Latest News</span>
+          <button class="news-back-btn" onclick="flipBack(this)">← Back</button>
+        </div>
+        <div class="news-list"></div>
+      </div>
+    </div>
+  `;
+  grid.appendChild(card);
+
+  const labels      = stock.points.map(p => formatDate(p.date));
+  const prices      = stock.points.map(p => p.close);
+  const first       = prices[0];
+  const displayPrice = stock.latest_price ?? prices[prices.length - 1];
+  const pct         = ((displayPrice - first) / first * 100).toFixed(2);
+  const isUp        = pct >= 0;
+  const color       = COLORS[i % COLORS.length];
+
+  const ctx = document.getElementById(`chart-individual-${i}`).getContext('2d');
+  const instance = new Chart(ctx, {
+    type: 'line',
+    data: {
+      labels,
+      datasets: [{
+        label: stock.symbol,
+        data: prices,
+        borderColor:     color,
+        backgroundColor: color + '18',
+        borderWidth:     2,
+        pointRadius:     0,
+        pointHoverRadius: 4,
+        tension:         0,
+        fill:            true,
+      }],
+    },
+    options: {
+      responsive: true,
+      aspectRatio: isMobile() ? MOBILE_ASPECT[localStorage.getItem('chartSize') || 'M'] : 2,
+      plugins: {
+        legend: { display: false },
+        title: {
+          display: true,
+          text: `${stock.name || stock.symbol}   ${formatPrice(displayPrice, stock.currency)}   ${isUp ? '▲' : '▼'} ${Math.abs(pct)}%`,
+          color: isUp ? '#16a34a' : '#dc2626',
+          font: { size: 14, weight: 'bold' },
+          padding: { bottom: 12 },
+        },
+        tooltip: {
+          callbacks: {
+            label: ctx => formatPrice(ctx.parsed.y, stock.currency),
+          },
+        },
+      },
+      scales: {
+        x: {
+          ticks: { color: cssVar('--chart-tick'), maxTicksLimit: tickLimit(), maxRotation: 0 },
+          grid:  { color: cssVar('--chart-grid') },
+        },
+        y: {
+          ticks: {
+            color: cssVar('--chart-tick'),
+            callback: v => formatPrice(v, stock.currency),
+          },
+          grid: { color: cssVar('--chart-grid') },
+        },
+      },
+    },
+  });
+  individualInstances[i] = instance;
+}
+
 // ── Main ────────────────────────────────────────────────────────────────────
 async function compareStocks() {
   const seq = ++_compareSeq;
@@ -443,24 +557,55 @@ async function compareStocks() {
   if (symbols.length === 0) { showError('Enter at least one stock symbol.'); return; }
 
   saveTickers();
-
   setLoading(true);
   hideError();
 
+  // Destroy old individual charts
+  individualInstances.forEach(c => c && c.destroy());
+  individualInstances = new Array(symbols.length).fill(null);
+
+  // Set up the grid immediately so cards appear as they load
+  const wrap = document.getElementById('individual-charts');
+  wrap.innerHTML = `<h2 class="section-title">Individual Charts</h2><div class="individual-grid" id="ind-grid"></div>`;
+  const grid = document.getElementById('ind-grid');
+
+  // Placeholder skeleton cards so layout doesn't jump
+  symbols.forEach((sym, i) => {
+    const ph = document.createElement('div');
+    ph.className = 'individual-card card-skeleton';
+    ph.id = `ind-card-${i}`;
+    ph.style.borderTop = `3px solid ${COLORS[i % COLORS.length]}`;
+    ph.innerHTML = `<div class="card-skeleton-label">${escHtml(sym)}</div>`;
+    grid.appendChild(ph);
+  });
+
+  const stocksData = new Array(symbols.length).fill(null);
+  const errors = [];
+
   try {
-    const results = await Promise.allSettled(symbols.map(fetchStock));
+    const fetchPromises = symbols.map((sym, i) =>
+      fetchStock(sym).then(stock => {
+        if (seq !== _compareSeq) return;
+        stocksData[i] = stock;
+        _renderCard(grid, stock, i, '#?');
+      }).catch(err => {
+        if (seq !== _compareSeq) return;
+        errors.push(err.message);
+        const ph = document.getElementById(`ind-card-${i}`);
+        if (ph) {
+          ph.className = 'individual-card card-error-state';
+          ph.style.borderTop = `3px solid ${COLORS[i % COLORS.length]}`;
+          ph.innerHTML = `<div class="card-skeleton-label">${escHtml(sym)}: ${escHtml(err.message)}</div>`;
+        }
+      })
+    );
 
-    if (seq !== _compareSeq) return; // superseded by a newer request
+    await Promise.allSettled(fetchPromises);
 
-    const seenSymbols = new Set();
-    const stocksData = results
-      .filter(r => r.status === 'fulfilled')
-      .map(r => r.value)
-      .filter(s => { if (seenSymbols.has(s.symbol)) return false; seenSymbols.add(s.symbol); return true; });
-    const failed     = results.filter(r => r.status === 'rejected').map(r => r.reason.message);
+    if (seq !== _compareSeq) return;
 
-    if (failed.length > 0) {
-      const msgs = failed.map(m =>
+    if (errors.length > 0) {
+      const msgs = errors.map(m =>
         (m.toLowerCase().includes('rate') || m.includes('429'))
           ? 'Data provider is busy — please wait a moment and try again.'
           : m
@@ -470,19 +615,36 @@ async function compareStocks() {
       hideError();
     }
 
-    if (stocksData.length === 0) return;
+    const seenSymbols = new Set();
+    const validStocks = stocksData
+      .filter(Boolean)
+      .filter(s => { if (seenSymbols.has(s.symbol)) return false; seenSymbols.add(s.symbol); return true; });
 
-    lastStocksData = stocksData;
+    if (validStocks.length === 0) return;
+
+    lastStocksData = validStocks;
     updateURL();
     document.getElementById('chart-wrap').style.display = comparisonHidden ? 'none' : 'block';
     document.getElementById('toggle-comparison-btn').style.display = 'inline-block';
     const sortBtn = document.getElementById('sort-btn');
     sortBtn.style.display = 'inline-block';
     sortBtn.classList.toggle('active', rankSortOn);
-    const displayData = getDisplayData(stocksData);
-    renderChart(stocksData);
-    renderIndividualCharts(displayData);
+
+    // Compute final ranks and update rank badges
+    const rankEntries = validStocks.map((stock, idx) => {
+      const prices = stock.points.map(p => p.close);
+      const latest = stock.latest_price ?? prices[prices.length - 1];
+      return { idx, pct: prices[0] ? (latest - prices[0]) / prices[0] * 100 : 0 };
+    }).sort((a, b) => b.pct - a.pct);
+    rankEntries.forEach((entry, rank) => {
+      const badge = document.getElementById(`rank-badge-${entry.idx}`);
+      if (badge) badge.textContent = `#${rank + 1}`;
+    });
+
+    const displayData = getDisplayData(validStocks);
+    renderChart(validStocks);
     reorderTickerInputsToMatch(displayData);
+    initDragAndDrop();
   } finally {
     if (seq === _compareSeq) setLoading(false);
   }
