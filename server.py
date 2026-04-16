@@ -593,9 +593,14 @@ def _get_stock_data(symbol, period):
         except Exception:
             pass
 
+        prev_close = _safe(
+            info.get('previousClose') or info.get('regularMarketPreviousClose')
+        )
+
         fund_data = {
             'name':          name,
             'currency':      currency,
+            'prev_close':    prev_close,
             'pe_ratio':      pe,
             'market_cap':    cap,
             'eps':           eps,

@@ -179,6 +179,7 @@ function _parseStockData(data) {
     currency:      data.currency || 'USD',
     points:        data.points.map(p => ({ date: new Date(p.date), close: p.close })),
     latest_price:  data.latest_price,
+    prev_close:    data.prev_close ?? null,
     pe_ratio:      data.pe_ratio,
     market_cap:    data.market_cap,
     eps:           data.eps,
@@ -193,6 +194,14 @@ function _parseStockData(data) {
     roic:          data.roic,
     earnings_date: data.earnings_date,
   };
+}
+
+// Return the correct baseline price for % change calculation.
+// 1D: use yesterday's official close (matches Google/Yahoo Finance).
+// All other ranges: use the first bar in the fetched history.
+function _baseline(stock) {
+  if (currentRange === '1d' && stock.prev_close != null) return stock.prev_close;
+  return stock.points[0].close;
 }
 
 async function fetchStock(symbol) {
@@ -233,7 +242,7 @@ function formatDate(date) {
 // ── Build chart datasets ────────────────────────────────────────────────────
 function buildDatasets(stocksData) {
   return stocksData.map((stock, i) => {
-    const base = stock.points[0].close;
+    const base = _baseline(stock);
 
     const data = stock.points.map(p => ({
       x: formatDate(p.date),
@@ -371,7 +380,7 @@ function renderIndividualCharts(stocksData) {
   stocksData.forEach((stock, i) => {
     const labels      = stock.points.map(p => formatDate(p.date));
     const prices      = stock.points.map(p => p.close);
-    const first       = prices[0];
+    const first       = _baseline(stock);
     const displayPrice = stock.latest_price ?? prices[prices.length - 1];
     const pct         = ((displayPrice - first) / first * 100).toFixed(2);
     const isUp        = pct >= 0;
@@ -658,7 +667,8 @@ async function compareStocks() {
     const rankEntries = validStocks.map((stock, idx) => {
       const prices = stock.points.map(p => p.close);
       const latest = stock.latest_price ?? prices[prices.length - 1];
-      return { idx, pct: prices[0] ? (latest - prices[0]) / prices[0] * 100 : 0 };
+      const base = _baseline(stock);
+      return { idx, pct: base ? (latest - base) / base * 100 : 0 };
     }).sort((a, b) => b.pct - a.pct);
     rankEntries.forEach((entry, rank) => {
       const badge = document.getElementById(`rank-badge-${entry.idx}`);
@@ -957,7 +967,7 @@ function getDisplayData(data) {
   return [...data].sort((a, b) => {
     const pct = s => {
       const prices = s.points.map(p => p.close);
-      return ((s.latest_price ?? prices[prices.length - 1]) - prices[0]) / prices[0];
+      return ((s.latest_price ?? prices[prices.length - 1]) - _baseline(s)) / _baseline(s);
     };
     return pct(b) - pct(a);
   });
