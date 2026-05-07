@@ -1,5 +1,6 @@
 flask
 yfinance
+curl_cffi
 requests
 werkzeug
 gunicorn
