@@ -1280,10 +1280,17 @@ function switchTab(tab) {
     );
   }
   if (isForgot) {
-    document.getElementById('forgot-username').value = '';
+    // Pre-fill with whatever username was typed on the login screen
+    const loginUsername = document.getElementById('auth-username').value.trim();
+    document.getElementById('forgot-username').value = loginUsername;
     document.getElementById('forgot-error').style.display = 'none';
     document.getElementById('forgot-result').style.display = 'none';
-    setTimeout(() => document.getElementById('forgot-username').focus(), 50);
+    setTimeout(() => {
+      const el = document.getElementById('forgot-username');
+      el.focus();
+      // Place cursor at end so user can edit if needed
+      el.setSelectionRange(el.value.length, el.value.length);
+    }, 50);
   }
   if (isReset) {
     document.getElementById('reset-password').value = '';
